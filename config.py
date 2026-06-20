@@ -1,4 +1,4 @@
-```python
+
 import os
 BOT_TOKEN           = os.environ.get("BOT_TOKEN", "YOUR_TOKEN")
 SUPERADMIN_ID       = int(os.environ.get("SUPERADMIN_ID", "0"))
