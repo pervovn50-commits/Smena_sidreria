@@ -163,14 +163,16 @@ async def cmd_start(msg: types.Message, state: FSMContext):
                          reply_markup=kb_main("superadmin", uid))
         return
 
+    # Сначала получаем пользователя, если есть — обновляем имя/username
     user = db.get_user(uid)
+    if user:
+        db.upsert_user(uid, msg.from_user.username, msg.from_user.full_name)
+        user = db.get_user(uid)  # обновлённые данные
 
     if user and user["role"] == "barista":
-        db.upsert_user(uid, msg.from_user.username, msg.from_user.full_name)
         await msg.answer("☕ <b>Привет!</b> Выберите действие:",
                          reply_markup=kb_main("barista", uid))
     elif user and user["role"] == "manager":
-        db.upsert_user(uid, msg.from_user.username, msg.from_user.full_name)
         await msg.answer("☕ <b>Привет, управляющий!</b>",
                          reply_markup=kb_main("manager", uid))
     elif user and user["role"] == "rejected":
@@ -178,6 +180,8 @@ async def cmd_start(msg: types.Message, state: FSMContext):
     elif user and user["role"] == "pending":
         await msg.answer("⏳ Заявка уже отправлена. Ожидайте одобрения.")
     else:
+        # Новый пользователь — регистрируем и показываем выбор роли
+        db.upsert_user(uid, msg.from_user.username, msg.from_user.full_name)
         kb = kb_inline([
             ("👨‍🍳 Я бариста",     "reg:barista"),
             ("👔 Я управляющий", "reg:manager"),
@@ -237,8 +241,13 @@ async def approve_staff(call: types.CallbackQuery):
     role_label = "бариста" if role == "barista" else "управляющий"
     await call.message.answer(f"✅ Одобрен как <b>{role_label}</b>.")
     try:
-        await bot.send_message(uid,
-            f"✅ <b>Заявка одобрена!</b> Роль: <b>{role_label}</b>\nНажмите /start")
+        # Сразу показываем меню без необходимости писать /start
+        menu = kb_main(role, uid)
+        if role == "barista":
+            welcome = "✅ <b>Заявка одобрена!</b> Добро пожаловать!\nВыберите действие:"
+        else:
+            welcome = "✅ <b>Заявка одобрена!</b> Добро пожаловать, управляющий!\nВыберите действие:"
+        await bot.send_message(uid, welcome, reply_markup=menu)
     except Exception:
         pass
 
