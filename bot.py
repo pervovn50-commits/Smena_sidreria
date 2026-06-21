@@ -163,18 +163,19 @@ async def cmd_start(msg: types.Message, state: FSMContext):
                          reply_markup=kb_main("superadmin", uid))
         return
 
-    db.upsert_user(uid, msg.from_user.username, msg.from_user.full_name)
     user = db.get_user(uid)
 
-    if user["role"] == "barista":
+    if user and user["role"] == "barista":
+        db.upsert_user(uid, msg.from_user.username, msg.from_user.full_name)
         await msg.answer("☕ <b>Привет!</b> Выберите действие:",
                          reply_markup=kb_main("barista", uid))
-    elif user["role"] == "manager":
+    elif user and user["role"] == "manager":
+        db.upsert_user(uid, msg.from_user.username, msg.from_user.full_name)
         await msg.answer("☕ <b>Привет, управляющий!</b>",
                          reply_markup=kb_main("manager", uid))
-    elif user["role"] == "rejected":
+    elif user and user["role"] == "rejected":
         await msg.answer("⛔ Ваш аккаунт заблокирован. Обратитесь к управляющему.")
-    elif user["role"] == "pending":
+    elif user and user["role"] == "pending":
         await msg.answer("⏳ Заявка уже отправлена. Ожидайте одобрения.")
     else:
         kb = kb_inline([
