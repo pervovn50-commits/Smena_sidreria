@@ -133,6 +133,16 @@ def can_work(tg_id: int) -> bool:
 #  /start — РЕГИСТРАЦИЯ
 # ═══════════════════════════════════════════════════════════
 
+@dp.message(Command("myid"))
+async def cmd_myid(msg: types.Message):
+    uid   = msg.from_user.id
+    is_sa = (uid == config.SUPERADMIN_ID)
+    await msg.answer(
+        f"🆔 Ваш Telegram ID: <code>{uid}</code>\n"
+        f"SUPERADMIN_ID в боте: <code>{config.SUPERADMIN_ID}</code>\n"
+        f"Совпадают: {'✅ Да' if is_sa else '❌ Нет'}"
+    )
+
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message, state: FSMContext):
     await state.clear()
