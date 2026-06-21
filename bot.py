@@ -143,6 +143,15 @@ async def cmd_myid(msg: types.Message):
         f"Совпадают: {'✅ Да' if is_sa else '❌ Нет'}"
     )
 
+@dp.message(Command("cleardb"))
+async def cmd_cleardb(msg: types.Message):
+    if msg.from_user.id != config.SUPERADMIN_ID:
+        await msg.answer("Нет доступа.")
+        return
+    with db.get_db() as conn:
+        conn.execute("DELETE FROM users WHERE role = 'pending'")
+    await msg.answer("Все pending-заявки удалены. Сотрудники могут заново написать /start.")
+
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message, state: FSMContext):
     await state.clear()
