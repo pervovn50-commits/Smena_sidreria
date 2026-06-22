@@ -4,7 +4,8 @@
 """
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
@@ -18,6 +19,20 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
 import database as db
+
+def now_msk() -> datetime:
+    """Текущее время в московском часовом поясе."""
+    return datetime.now(ZoneInfo(config.TIMEZONE)).replace(tzinfo=None)
+
+def to_msk(dt) -> datetime:
+    """Конвертировать UTC datetime из БД в московское время."""
+    if dt is None:
+        return dt
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZoneInfo(config.TIMEZONE)).replace(tzinfo=None)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -37,7 +52,11 @@ class RegState(StatesGroup):
 class AddDisplay(StatesGroup):
     choose_category = State()
     choose_item     = State()
-    enter_quantity  = State()
+    edit_hours      = State()   # только для управляющего
+
+class EditDisplayHours(StatesGroup):
+    choose_item = State()
+    enter_hours = State()
 
 class WriteoffFlow(StatesGroup):
     choose_item   = State()
@@ -74,7 +93,8 @@ def kb_main(role: str, tg_id: int) -> ReplyKeyboardMarkup:
     if role == "manager" or is_sa:
         rows.append([KeyboardButton(text="📊 Остатки десертов"),
                      KeyboardButton(text="👥 Сотрудники")])
-        rows.append([KeyboardButton(text="🍽 Управление меню")])
+        rows.append([KeyboardButton(text="🍽 Управление меню"),
+                     KeyboardButton(text="⏱ Изменить срок")])
     if is_sa:
         rows.append([KeyboardButton(text="🔑 Управляющие")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -97,8 +117,8 @@ def kb_inline_rows(rows: list[list[tuple]]) -> InlineKeyboardMarkup:
 # ═══════════════════════════════════════════════════════════
 
 def hours_on_display(added_at_str: str) -> float:
-    added = datetime.fromisoformat(str(added_at_str))
-    return round((datetime.now() - added).total_seconds() / 3600, 1)
+    added = to_msk(added_at_str)
+    return round((now_msk() - added).total_seconds() / 3600, 1)
 
 def status_emoji(hours_left) -> str:
     if hours_left is None or hours_left < 0: return "🔴"
@@ -563,34 +583,70 @@ async def display_category(call: types.CallbackQuery, state: FSMContext):
 async def display_item_chosen(call: types.CallbackQuery, state: FSMContext):
     item_id = int(call.data.split(":")[1])
     item = db.get_menu_item_by_id(item_id)
+    uid = call.from_user.id
+    role = get_role(uid)
     await state.update_data(item_id=item_id, item_name=item["name"],
                              shelf_hours=item["shelf_hours"],
                              category=item["category"])
-    await call.message.edit_text(
-        f"<b>{item['name']}</b> — срок {item['shelf_hours']} ч.\n\n"
-        f"Сколько штук ставим на витрину?"
-    )
-    await state.set_state(AddDisplay.enter_quantity)
+    if can_manage(uid):
+        # Управляющий может изменить срок перед постановкой
+        await call.message.edit_text(
+            f"<b>{item['name']}</b>\n"
+            f"Срок хранения: {item['shelf_hours']} ч.\n\n"
+            f"Поставить с этим сроком или изменить?",
+            reply_markup=kb_inline_rows([
+                [("✅ Поставить ({} ч.)".format(item['shelf_hours']), f"disp_confirm:{item_id}"),
+                 ("✏️ Изменить срок", f"disp_edit_hrs:{item_id}")]
+            ])
+        )
+        await state.set_state(AddDisplay.edit_hours)
+    else:
+        # Бариста — сразу ставим 1 штуку
+        await _put_on_display(call.message, state, uid, role, edit=True)
 
-@dp.message(AddDisplay.enter_quantity)
-async def display_quantity(msg: types.Message, state: FSMContext):
-    try:
-        qty = int(msg.text.strip())
-        if qty < 1 or qty > 99:
-            raise ValueError
-    except ValueError:
-        await msg.answer("Введите число от 1 до 99:")
-        return
+async def _put_on_display(message, state: FSMContext, uid: int, role: str, edit: bool = False):
     data = await state.get_data()
     await state.clear()
-    db.add_display_items(data["item_id"], data["shelf_hours"], msg.from_user.id, qty)
-    expires = datetime.now() + timedelta(hours=data["shelf_hours"])
-    role = get_role(msg.from_user.id)
-    await msg.answer(
-        f"✅ <b>{data['item_name']}</b> × {qty} шт. — на витрине\n"
-        f"⏰ Годно до: {expires.strftime('%H:%M, %d.%m.%Y')}",
-        reply_markup=kb_main(role, msg.from_user.id)
+    db.add_display_items(data["item_id"], data["shelf_hours"], uid, 1)
+    expires = now_msk() + timedelta(hours=data["shelf_hours"])
+    text = (
+        f"✅ <b>{data['item_name']}</b> — на витрине\n"
+        f"⏰ Годно до: {expires.strftime('%H:%M, %d.%m.%Y')}"
     )
+    kb = kb_main(role, uid)
+    if edit:
+        await message.edit_text(text)
+        await message.answer("Выберите действие:", reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+
+@dp.callback_query(AddDisplay.edit_hours, F.data.startswith("disp_confirm:"))
+async def disp_confirm(call: types.CallbackQuery, state: FSMContext):
+    uid = call.from_user.id
+    role = get_role(uid)
+    await _put_on_display(call.message, state, uid, role, edit=True)
+
+@dp.callback_query(AddDisplay.edit_hours, F.data.startswith("disp_edit_hrs:"))
+async def disp_edit_hrs_start(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await call.message.edit_reply_markup()
+    await call.message.answer(
+        f"Введите новый срок хранения для <b>{data['item_name']}</b> (в часах):"
+    )
+
+@dp.message(AddDisplay.edit_hours)
+async def disp_edit_hrs_enter(msg: types.Message, state: FSMContext):
+    try:
+        hours = int(msg.text.strip())
+        if hours < 1 or hours > 9999:
+            raise ValueError
+    except ValueError:
+        await msg.answer("Введите целое число от 1 до 9999:")
+        return
+    await state.update_data(shelf_hours=hours)
+    uid = msg.from_user.id
+    role = get_role(uid)
+    await _put_on_display(msg, state, uid, role, edit=False)
 
 # ═══════════════════════════════════════════════════════════
 #  🗑 СПИСАНИЕ
@@ -607,7 +663,7 @@ async def writeoff_start(msg: types.Message, state: FSMContext):
     buttons = []
     for r in items:
         em = status_emoji(r["hours_left"])
-        added = datetime.fromisoformat(str(r["added_at"])).strftime("%H:%M %d.%m")
+        added = to_msk(r["added_at"]).strftime("%H:%M %d.%m")
         h = r["hours_left"]
         h_label = f"{h} ч." if h and h >= 0 else "ПРОСРОЧЕНО"
         buttons.append((f"{em} {r['name']} — {h_label} (с {added})", f"wo:{r['id']}"))
@@ -660,7 +716,7 @@ async def writeoff_reason(call: types.CallbackQuery, state: FSMContext):
         f"Причина: {reason}\n"
         f"Сотрудник: {emp_name}\n"
         f"На витрине: {hours} ч.\n"
-        f"🕐 {datetime.now().strftime('%H:%M, %d.%m.%Y')}"
+        f"🕐 {now_msk().strftime('%H:%M, %d.%m.%Y')}"
     )
 
 # ═══════════════════════════════════════════════════════════
@@ -709,7 +765,7 @@ async def sale_item(call: types.CallbackQuery, state: FSMContext):
         f"💰 <b>Продажа</b>\n"
         f"Позиция: <b>{item['name']}</b>\n"
         f"Сотрудник: {emp_name}\n"
-        f"🕐 {datetime.now().strftime('%H:%M, %d.%m.%Y')}"
+        f"🕐 {now_msk().strftime('%H:%M, %d.%m.%Y')}"
     )
 
 # ═══════════════════════════════════════════════════════════
@@ -727,8 +783,8 @@ async def show_display(msg: types.Message):
     lines = ["<b>📋 На витрине:</b>\n"]
     for r in items:
         em      = status_emoji(r["hours_left"])
-        added   = datetime.fromisoformat(str(r["added_at"])).strftime("%H:%M %d.%m")
-        expires = datetime.fromisoformat(str(r["expires_at"])).strftime("%H:%M %d.%m")
+        added   = to_msk(r["added_at"]).strftime("%H:%M %d.%m")
+        expires = to_msk(r["expires_at"]).strftime("%H:%M %d.%m")
         h       = r["hours_left"]
         h_label = f"{h} ч." if h and h >= 0 else "⚠️ ПРОСРОЧЕНО"
         cat_em  = "🍰" if r["category"] == "dessert" else "🍽"
@@ -737,6 +793,76 @@ async def show_display(msg: types.Message):
             f"   📥 {added} → ⏰ {expires} | {r['added_by']}"
         )
     await msg.answer("\n".join(lines))
+
+
+# ═══════════════════════════════════════════════════════════
+#  ⏱ РЕДАКТИРОВАТЬ СРОК НА ВИТРИНЕ (только управляющий)
+# ═══════════════════════════════════════════════════════════
+
+@dp.message(F.text == "⏱ Изменить срок")
+async def edit_display_hours_start(msg: types.Message, state: FSMContext):
+    if not can_manage(msg.from_user.id):
+        return
+    items = db.get_active_display_items()
+    if not items:
+        await msg.answer("На витрине ничего нет.")
+        return
+    buttons = []
+    for r in items:
+        em = status_emoji(r["hours_left"])
+        h = r["hours_left"]
+        h_label = f"{h} ч." if h and h >= 0 else "ПРОСРОЧЕНО"
+        cat_em = "🍰" if r["category"] == "dessert" else "🍽"
+        buttons.append((
+            f"{cat_em} {em} {r['name']} — {h_label}",
+            f"edh:{r['id']}"
+        ))
+    await msg.answer("Для какой позиции изменить срок?", reply_markup=kb_inline(buttons))
+    await state.set_state(EditDisplayHours.choose_item)
+
+@dp.callback_query(EditDisplayHours.choose_item, F.data.startswith("edh:"))
+async def edit_display_hours_chosen(call: types.CallbackQuery, state: FSMContext):
+    disp_id = int(call.data.split(":")[1])
+    items = db.get_active_display_items()
+    item = next((i for i in items if i["id"] == disp_id), None)
+    if not item:
+        await call.message.answer("❌ Позиция уже списана/продана.")
+        await state.clear()
+        return
+    expires = to_msk(item["expires_at"])
+    await state.update_data(disp_id=disp_id, item_name=item["name"])
+    await call.message.edit_reply_markup()
+    await call.message.answer(
+        f"<b>{item['name']}</b>\n"
+        f"Годна до: {expires.strftime('%H:%M %d.%m.%Y')}\n\n"
+        f"Введите новое время до истечения срока (в часах):\n"
+        f"<i>Например: 24 — продлить на сутки от текущего момента</i>"
+    )
+    await state.set_state(EditDisplayHours.enter_hours)
+
+@dp.message(EditDisplayHours.enter_hours)
+async def edit_display_hours_enter(msg: types.Message, state: FSMContext):
+    try:
+        hours = int(msg.text.strip())
+        if hours < 1 or hours > 9999:
+            raise ValueError
+    except ValueError:
+        await msg.answer("Введите целое число от 1 до 9999:")
+        return
+    data = await state.get_data()
+    await state.clear()
+    new_expires = now_msk() + timedelta(hours=hours)
+    with db.get_db() as conn:
+        conn.execute(
+            "UPDATE display_items SET expires_at=?, reminded=0 WHERE id=?",
+            (new_expires, data["disp_id"])
+        )
+    role = get_role(msg.from_user.id)
+    await msg.answer(
+        f"✅ <b>{data['item_name']}</b> — срок обновлён\n"
+        f"⏰ Новый срок: {new_expires.strftime('%H:%M, %d.%m.%Y')}",
+        reply_markup=kb_main(role, msg.from_user.id)
+    )
 
 # ═══════════════════════════════════════════════════════════
 #  📊 ОСТАТКИ ДЕСЕРТОВ
@@ -787,7 +913,7 @@ async def close_shift_confirmed(call: types.CallbackQuery, state: FSMContext):
     await call.message.answer("📊 Отчёт отправлен.", reply_markup=kb_main(role, uid))
 
 async def _send_shift_report(closed_by: str):
-    today = datetime.now().strftime("%d.%m.%Y")
+    today = now_msk().strftime("%d.%m.%Y")
     ops   = db.get_today_operations()
     if not ops:
         await send_report(
@@ -800,12 +926,12 @@ async def _send_shift_report(closed_by: str):
     if writeoffs:
         lines.append(f"🗑 <b>Списания ({len(writeoffs)}):</b>")
         for o in writeoffs:
-            t = datetime.fromisoformat(str(o["created_at"])).strftime("%H:%M")
+            t = to_msk(o["created_at"]).strftime("%H:%M")
             lines.append(f"  • {o['item_name']} — {o['reason']} ({o['hours_on_display']} ч.) [{o['employee_name']}, {t}]")
     if sales:
         lines.append(f"\n💰 <b>Продажи ({len(sales)}):</b>")
         for o in sales:
-            t = datetime.fromisoformat(str(o["created_at"])).strftime("%H:%M")
+            t = to_msk(o["created_at"]).strftime("%H:%M")
             lines.append(f"  • {o['item_name']} [{o['employee_name']}, {t}]")
     lines.append(f"\n📦 Итого: {len(writeoffs)} списаний, {len(sales)} продаж")
     await send_report("\n".join(lines))
@@ -817,8 +943,8 @@ async def _send_shift_report(closed_by: str):
 async def check_expiring():
     items = db.get_expiring_items()
     for item in items:
-        expires    = datetime.fromisoformat(str(item["expires_at"]))
-        hours_left = (expires - datetime.now()).total_seconds() / 3600
+        expires    = to_msk(item["expires_at"])
+        hours_left = (expires - now_msk()).total_seconds() / 3600
         sign       = "ПРОСРОЧЕНО" if hours_left < 0 else f"через {round(abs(hours_left), 1)} ч."
         await send_notification(
             f"⚠️ <b>Срок истекает!</b>\n"
