@@ -1,8 +1,7 @@
 import sqlite3
 from datetime import datetime
 
-import os
-DB_PATH = os.environ.get("DB_PATH", "/app/data/cafe.db")
+DB_PATH = "cafe.db"
 
 def get_db():
     conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
